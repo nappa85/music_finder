@@ -1,8 +1,11 @@
 use std::{collections::HashMap, path::PathBuf};
 
 use clap::Parser;
+use futures_concurrency::future::Join;
 use reqwest::Client;
 use scraper::{Html, Selector};
+use tokio::sync::Mutex;
+use tracing::error;
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about)]
@@ -28,7 +31,8 @@ async fn main() -> anyhow::Result<()> {
 
     let selector = Selector::parse("div#gnodMap a.S").expect("wrong selector");
 
-    let mut new_artists = HashMap::new();
+    let new_artists = Mutex::new(HashMap::new());
+    let mut join_set = Vec::new();
     let mut folders = tokio::fs::read_dir(args.folder).await?;
     let mut existing_artists = Vec::new();
     while let Ok(Some(entry)) = folders.next_entry().await {
@@ -43,39 +47,57 @@ async fn main() -> anyhow::Result<()> {
         let url = format!("https://www.music-map.com/{artist}");
         existing_artists.push(artist);
 
-        let page = Html::parse_document(
-            &client
-                .get(url)
-                .send()
-                .await?
-                .error_for_status()?
-                .text()
-                .await?,
-        );
-        for link in page.select(&selector) {
-            let entry: &mut (usize, usize) = new_artists
-                .entry(
-                    link.text()
-                        .next()
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("Can't find band name on link {}", link.html())
-                        })?
-                        .to_string(),
-                )
-                .or_default();
-            entry.0 += 1;
-            entry.1 += link
-                .value()
-                .attr("id")
-                .ok_or_else(|| anyhow::anyhow!("Can't find id on link {}", link.html()))?
-                .strip_prefix('s')
-                .ok_or_else(|| anyhow::anyhow!("Malformed id on link {}", link.html()))?
-                .parse::<usize>()
-                .map_err(|err| anyhow::anyhow!("Invalid id on link {}: {err}", link.html()))?;
-        }
+        join_set.push({
+            let new_artists = &new_artists;
+            let client = &client;
+            let selector = &selector;
+            async move {
+                let page = Html::parse_document(
+                    &client
+                        .get(&url)
+                        .send()
+                        .await
+                        .map_err(|err| error!("Error calling {url}: {err}"))?
+                        .error_for_status()
+                        .map_err(|err| error!("Received error from {url}: {err}"))?
+                        .text()
+                        .await
+                        .map_err(|err| error!("Error reading {url}: {err}"))?,
+                );
+
+                let mut new_artists = new_artists.lock().await;
+                for link in page.select(selector) {
+                    let entry: &mut (usize, usize) = new_artists
+                        .entry(
+                            link.text()
+                                .next()
+                                .ok_or_else(|| {
+                                    error!("Can't find band name on link {}", link.html())
+                                })?
+                                .to_string(),
+                        )
+                        .or_default();
+                    entry.0 += 1;
+                    entry.1 += link
+                        .value()
+                        .attr("id")
+                        .ok_or_else(|| error!("Can't find id on link {}", link.html()))?
+                        .strip_prefix('s')
+                        .ok_or_else(|| error!("Malformed id on link {}", link.html()))?
+                        .parse::<usize>()
+                        .map_err(|err| error!("Invalid id on link {}: {err}", link.html()))?;
+                }
+
+                Ok::<_, ()>(())
+            }
+        });
     }
 
+    // we are ignoring errors here
+    join_set.join().await;
+
     let mut artists: Vec<(String, (usize, usize))> = new_artists
+        .into_inner()
         .into_iter()
         .filter(|(name, _)| {
             !existing_artists
